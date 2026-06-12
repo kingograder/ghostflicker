@@ -1,150 +1,126 @@
 import argparse
 import logging
 import os
+from typing import Callable, List, Tuple, cast
 
 import av
 import numpy as np
 import torch
 from numpy.lib.stride_tricks import sliding_window_view
+from scenedetect import AdaptiveDetector, SceneManager, detect, open_video
 from torch._prims_common import DeviceLikeType
+from tqdm import tqdm
 from ultralytics import YOLO
-from migan_inference import Generator as MIGAN
 
-logging.basicConfig(level=logging.INFO)
+from migan_inference import Generator
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
-def create_parser():
-    parser = argparse.ArgumentParser(
-        description="Программа для маскировки вотермарок на видео",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CLI for watermark removal from video")
 
-    # Настройки io
+    # IO
     parser.add_argument(
-        "-i",
-        "--input",
-        required=True,
-        type=str,
-        help="Путь к входному видеофайлу",
+        "-i", "--input", required=True, type=str, help="Input video file path"
     )
-
     parser.add_argument(
-        "-o",
-        "--output",
-        required=True,
-        type=str,
-        help="Путь для выходного видеофайла.",
+        "-o", "--output", required=True, type=str, help="Output video file path"
     )
 
-    # Настройки программы
+    # Processing
     parser.add_argument(
         "--mode",
-        required=False,
-        type=str,
         choices=["static", "dynamic"],
         default="dynamic",
-        help="static — вотермарка неподвижна в пределах сцены (маска кэшируется), dynamic — может двигаться или появляться/исчезать внутри сцены",
+        help="Mask processing mode",
     )
     parser.add_argument(
         "--skip_empty_scenes",
         action="store_true",
-        help="Пропускать сцены, в которых не обнаружена вотермарка.",
+        help="Skip scenes without watermark",
     )
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+
+    # Models & Device
+    parser.add_argument("--path_to_yolo_model", required=True, type=str)
+    parser.add_argument("--path_to_migan_model", required=True, type=str)
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-        help="Размер батча для пакетной обработки кадров",
+        "-d", "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
 
-    # Настройки scenedetect
-    # Настройки yolo
+    # Hardware Acceleration
     parser.add_argument(
-        "--path_to_yolo_model",
-        required=False,
-        type=str,
+        "--use_gpu_decode",
+        action="store_true",
+        help="Use h264_cuvid for decoding",
     )
     parser.add_argument(
-        "-d",
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Устройство для вычислений (cuda или cpu)",
-    )
-    # Настройки video
-    # Настройки migan
-    parser.add_argument(
-        "--path_to_migan_model",
-        required=True,
-        type=str,
-    )
-    # Настройки маски
-    parser.add_argument(
-        "--bbox",
-        type=int,
-        nargs=4,
-        metavar=("x1", "y1", "x2", "y2"),
-        help="Координаты вотермарки: левый верхний и правый нижний угол",
+        "--use_gpu_encode",
+        action="store_true",
+        help="Use h264_nvenc for encoding",
     )
 
+    # Mask settings
+    parser.add_argument("--bbox", type=int, nargs=4, metavar=("x1", "y1", "x2", "y2"))
+    parser.add_argument("--blur", type=int, default=0)
     parser.add_argument(
-        "--blur",
+        "--padding", type=int, default=20, help="Context padding around bbox for crop"
+    )
+    parser.add_argument(
+        "--mask_dilation",
         type=int,
         default=0,
-        required=False,
-        help="Сила размытия маски",
+        help="Expand mask by N pixels on all sides",
     )
 
-    parser.add_argument(
-        "--padding",
-        type=int,
-        default=5,
-        required=False,
-        help="Внешний отступ для выделенной области.",  # Внешний отступ делать пропорциональным или строгим (проценты или пиксели?)
-    )
+    # Previews
+    parser.add_argument("--mask_preview", action="store_true")
+    parser.add_argument("--inpaint_preview", action="store_true")
 
-    # Параметры для предварительного просмотра работы программы
-    parser.add_argument(
-        "--mask-preview",
-        action="store_true",
-        help="При включении сохраняет маску для первого кадра видео в выходную директорию.",
-    )
-
-    parser.add_argument(
-        "--inpaint-preview",
-        action="store_true",
-        help="При включении обрабатывает первый кадр видео и сохраняет его в выходную директорию.",
-    )
     return parser
 
 
-def detect_scenes():
-    pass
+def detect_scenes(
+    path_to_video: str,
+    threshold: float = 60.0,
+    min_scene_len_frames: int = 15,
+    return_frame_numbers: bool = True,
+) -> List[int] | List[Tuple[float, float]]:
+    """
+    Detects scenes in video using PyAV backend.
 
-
-def expand_bbox(bbox, padding: int, width: int, height: int) -> tuple:
-    """Расширяет границы bbox на заданный padding с учетом границ изображения."""
-    x1, y1, x2, y2 = map(int, bbox)
-    return (
-        max(0, x1 - padding),
-        max(0, y1 - padding),
-        min(width, x2 + padding),
-        min(height, y2 + padding),
+    Args:
+        video_path: Path to video file
+        threshold: Sensitivity threshold (default 27.0)
+        use_adaptive: Use AdaptiveDetector (resistant to camera motion)
+        min_scene_len: Minimum scene length in frames (noise filter)
+        return_frame_numbers: True -> list of first frame numbers of scenes.
+                              False -> list of (start_seconds, end_seconds) tuples.
+    """
+    video = open_video(path_to_video, backend="pyav")
+    scene_manager = SceneManager()
+    detector = AdaptiveDetector(
+        adaptive_threshold=threshold, min_scene_len=min_scene_len_frames
     )
+    scene_manager.add_detector(detector)
+    scene_manager.detect_scenes(video=video)
+    scenes = scene_manager.get_scene_list()
 
+    if not scenes:
+        return []
 
-def rasterize_bbox(width: int, height: int, bbox: tuple) -> np.ndarray:
-    """Создает бинарную маску по координатам bbox."""
-    mask = np.zeros((height, width), dtype=np.uint8)
-    x1, y1, x2, y2 = bbox
-
-    if y1 < y2 and x1 < x2:
-        mask[y1:y2, x1:x2] = 255
-    return mask
+    if return_frame_numbers:
+        return [scene[0].frame_num for scene in scenes]
+    else:
+        return [(scene[0].get_seconds(), scene[1].get_seconds()) for scene in scenes]
 
 
 def apply_gaussian_blur(mask: np.ndarray, sigma: int) -> np.ndarray:
-    """Применяет разделимое гауссово размытие."""
+    """Applies separable Gaussian blur."""
     radius = max(1, int(np.ceil(3 * sigma)))
 
     x = np.arange(-radius, radius + 1, dtype=np.float32)
@@ -164,470 +140,282 @@ def apply_gaussian_blur(mask: np.ndarray, sigma: int) -> np.ndarray:
     return np.clip(blurred, 0, 255).astype(np.uint8)
 
 
-def create_mask(
-    width: int, height: int, bbox: list, blur: int, padding: int
-) -> np.ndarray:  # На самом же деле на данном этапе не надо размывать маску, маска должна размываться в момент наложения маскировки на исходный кадр.
-    """Расширяет, растеризует и размывает маску."""
-    if not bbox:
-        raise ValueError("bbox cannot be None")
-    effective_bbox = (
-        expand_bbox(bbox, padding, width, height)
-        if padding > 0
-        else tuple(map(int, bbox))
-    )
-    mask = rasterize_bbox(width, height, effective_bbox)
-    """
-    if blur is not None and float(blur) > 0:
-        mask = apply_gaussian_blur(mask, blur)
-    """
-    return np.array(mask).astype(np.uint8)
-
-def get_crop_params(bbox, padding, width, height):
-    """Вычисляет параметры кропа без создания полной маски, сохраняя кратность 8."""
-    x1, y1, x2, y2 = expand_bbox(bbox, padding, width, height)
-    cx = (x1 + x2) // 2
-    cy = (y1 + y2) // 2
-    region_w = x2 - x1
-    region_h = y2 - y1
-    
-    # Размеры кратные 8
-    crop_w = int(np.ceil(region_w / 8.0) * 8)
-    crop_h = int(np.ceil(region_h / 8.0) * 8)
-    
-    # Координаты кропа (центрируем относительно маски)
-    left = cx - crop_w // 2
-    top = cy - crop_h // 2
-    
-    # Сдвигаем кроп, если он выходит за границы изображения
-    if left + crop_w > width:
-        left = width - crop_w
-    if left < 0:
-        left = 0
-        crop_w = (width // 8) * 8
-        
-    if top + crop_h > height:
-        top = height - crop_h
-    if top < 0:
-        top = 0
-        crop_h = (height // 8) * 8
-        
-    return (left, top, crop_w, crop_h), (x1, y1, x2, y2)
-
-
-def create_cropped_mask(crop_w, crop_h, effective_bbox, left, top):
-    """Создает маску только для кропа, без полной маски."""
-    mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
-    
-    # Переносим координаты bbox в систему координат кропа
-    x1_c = max(0, effective_bbox[0] - left)
-    y1_c = max(0, effective_bbox[1] - top)
-    x2_c = min(crop_w, effective_bbox[2] - left)
-    y2_c = min(crop_h, effective_bbox[3] - top)
-    
-    if y1_c < y2_c and x1_c < x2_c:
-        mask[y1_c:y2_c, x1_c:x2_c] = 255
-    return mask
-
-
-def gaussian_blur_2d(tensor, sigma):
-    """Гауссово размытие на GPU."""
+def process_frame(
+    frame: np.ndarray,
+    bbox: list | None,
+    yolo_model: YOLO,
+    migan_model,
+    device: torch.device,
+    padding: int = 20,
+    mask_dilation: int = 0,
+) -> np.ndarray:
     import torch.nn.functional as F
-    kernel_size = int(2 * round(3 * sigma) + 1)
-    x = torch.arange(kernel_size, device=tensor.device) - kernel_size // 2
-    gauss = torch.exp(-0.5 * (x / sigma) ** 2)
-    gauss /= gauss.sum()
-    kernel = gauss[:, None] * gauss[None, :]
-    kernel = kernel.expand(tensor.shape[1], 1, kernel_size, kernel_size)
-    return F.conv2d(tensor, kernel, padding=kernel_size//2, groups=tensor.shape[1])
 
+    img_h, img_w = frame.shape[:2]
 
-def process_video_frame(frame_gpu, bbox, padding, blur_sigma, inpainting_fn):
-    """
-    Обработка одного кадра видеопотока с минимальным использованием памяти.
-    frame_gpu: torch.Tensor (C, H, W) на GPU.
-    """
-    _, H, W = frame_gpu.shape
-    
-    # 1. Вычисляем параметры кропа (без создания маски)
-    (left, top, crop_w, crop_h), eff_bbox = get_crop_params(bbox, padding, W, H)
-    
-    # 2. Создаем ТОЛЬКО кроп маски (маленький массив) и переносим на GPU
-    crop_mask_np = create_cropped_mask(crop_w, crop_h, eff_bbox, left, top)
-    crop_mask = torch.from_numpy(crop_mask_np).to(frame_gpu.device, dtype=torch.float32) / 255.0
-    
-    # 3. Вырезаем кроп изображения (view, без копирования)
-    crop_img = frame_gpu[:, top:top+crop_h, left:left+crop_w]
-    
-    # 4. Нормализуем кроп изображения в диапазон [-1, 1]
-    crop_img_normalized = crop_img.float() * 2.0 / 255.0 - 1.0
-    
-    # 5. Подготавливаем 4-канальный вход (N, 4, H, W)
-    mask_channel = crop_mask.unsqueeze(0)
-    x = torch.cat([mask_channel - 0.5, crop_img_normalized * mask_channel], dim=0).unsqueeze(0)
-    
-    # 6. Инпейнтинг
-    with torch.no_grad():
-        processed_crop = inpainting_fn(x)  # Ожидает (1, 4, H, W), возвращает (1, 3, H, W)
-    processed_crop = processed_crop.squeeze(0)  # (3, Hc, Wc)
-    
-    # 7. Денормализация в [0, 255]
-    processed_crop = (processed_crop * 0.5 + 0.5).clamp(0, 1) * 255.0
-    
-    # 8. Размытие маски на GPU (если нужно)
-    if blur_sigma and blur_sigma > 0:
-        blur_input = mask_channel.unsqueeze(0)
-        blurred_mask = gaussian_blur_2d(blur_input, blur_sigma).squeeze(0)
-        alpha = blurred_mask
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
     else:
-        alpha = mask_channel
-    
-    # 9. Альфа-смешивание и обратная вставка
-    result = frame_gpu.clone()
-    roi = result[:, top:top+crop_h, left:left+crop_w].float()
-    blended = (1.0 - alpha) * roi + alpha * processed_crop
-    result[:, top:top+crop_h, left:left+crop_w] = blended.to(frame_gpu.dtype)
-    
-    return result
+        results = yolo_model(frame, verbose=False)
+        if len(results) == 0 or len(results[0].boxes) == 0:
+            return frame
+        box = results[0].boxes[0]
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
+    expanded = expand_bbox((x1, y1, x2, y2), padding, (img_h, img_w))
+    cropped, adjusted = crop_frame_aligned(frame, expanded)
 
-def process_video_frames_batch(frames_gpu, bboxes, padding, blur_sigma, inpainting_fn):
-    """
-    Пакетная обработка кадров видеопотока.
-    frames_gpu: список из B тензоров формы (C, H, W) на GPU.
-    bboxes: список из B bboxes (по одному на кадр) или один bbox для всех кадров.
-    """
-    B = len(frames_gpu)
-    if B == 0:
-        return []
-        
-    _, H, W = frames_gpu[0].shape
-    device = frames_gpu[0].device
-    
-    # Нормализуем bboxes в список длиной B
-    if not isinstance(bboxes[0], (list, tuple, np.ndarray)) or len(bboxes) != B:
-        bboxes = [bboxes] * B
-        
-    # Чтобы объединить в батч, кропы должны быть одинакового размера.
-    # Вычисляем параметры кропа для каждого кадра
-    crop_params = [get_crop_params(bboxes[i], padding, W, H) for i in range(B)]
-    
-    # Определим максимальные crop_w и crop_h в батче, чтобы все кропы привести к одной форме
-    max_crop_w = max(p[0][2] for p in crop_params)
-    max_crop_h = max(p[0][3] for p in crop_params)
-    
-    adjusted_params = []
-    for i in range(B):
-        (left, top, crop_w, crop_h), eff_bbox = crop_params[i]
-        # Центрируем кроп максимального размера относительно исходного центра
-        cx = left + crop_w // 2
-        cy = top + crop_h // 2
-        
-        n_left = cx - max_crop_w // 2
-        n_top = cy - max_crop_h // 2
-        
-        # Корректируем границы
-        if n_left + max_crop_w > W:
-            n_left = W - max_crop_w
-        if n_left < 0:
-            n_left = 0
-        if n_top + max_crop_h > H:
-            n_top = H - max_crop_h
-        if n_top < 0:
-            n_top = 0
-            
-        adjusted_params.append(((n_left, n_top, max_crop_w, max_crop_h), eff_bbox))
+    crop_x1, crop_y1 = adjusted[0], adjusted[1]
 
-    crop_imgs = []
-    crop_masks = []
-    
-    for i in range(B):
-        (left, top, crop_w, crop_h), eff_bbox = adjusted_params[i]
-        
-        # 1. Создаем кроп маски
-        mask_np = create_cropped_mask(crop_w, crop_h, eff_bbox, left, top)
-        mask_tensor = torch.from_numpy(mask_np).to(device, dtype=torch.float32) / 255.0
-        crop_masks.append(mask_tensor.unsqueeze(0)) # (1, Hc, Wc)
-        
-        # 2. Вырезаем кроп изображения
-        crop_img = frames_gpu[i][:, top:top+crop_h, left:left+crop_w]
-        crop_img_normalized = crop_img.float() * 2.0 / 255.0 - 1.0
-        crop_imgs.append(crop_img_normalized)
-        
-    # Объединяем в батч
-    batch_imgs = torch.stack(crop_imgs, dim=0)
-    batch_masks = torch.stack(crop_masks, dim=0)
-    
-    # 5. Подготавливаем 4-канальный вход (B, 4, Hc, Wc)
-    x = torch.cat([batch_masks - 0.5, batch_imgs * batch_masks], dim=1)
-    
-    # 6. Инпейнтинг
+    mask = np.ones(cropped.shape[:2], dtype=np.float32)
+    mx1 = max(0, x1 - crop_x1 - mask_dilation)
+    my1 = max(0, y1 - crop_y1 - mask_dilation)
+    mx2 = min(cropped.shape[1], x2 - crop_x1 + mask_dilation)
+    my2 = min(cropped.shape[0], y2 - crop_y1 + mask_dilation)
+    mask[my1:my2, mx1:mx2] = 0.0
+
+    model_res = migan_model.synthesis.resolution
+    crop_h, crop_w = cropped.shape[:2]
+
+    img_tensor = torch.from_numpy(cropped).permute(2, 0, 1).float() * 2 / 255 - 1
+    mask_tensor = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0)
+
+    img_resized = F.interpolate(
+        img_tensor.unsqueeze(0),
+        size=(model_res, model_res),
+        mode="bilinear",
+        align_corners=False,
+    )[0]
+    mask_resized = F.interpolate(
+        mask_tensor, size=(model_res, model_res), mode="nearest"
+    )[0]
+
+    inp = (
+        torch.cat([mask_resized - 0.5, img_resized * mask_resized], dim=0)
+        .unsqueeze(0)
+        .to(device)
+    )
+
     with torch.no_grad():
-        processed_crops = inpainting_fn(x)  # Ожидает (B, 4, Hc, Wc), возвращает (B, 3, Hc, Wc)
-        
-    # 7. Денормализация в [0, 255]
-    processed_crops = (processed_crops * 0.5 + 0.5).clamp(0, 1) * 255.0
-    
-    # 8. Размытие маски на GPU
-    if blur_sigma and blur_sigma > 0:
-        alpha = gaussian_blur_2d(batch_masks, blur_sigma)
-    else:
-        alpha = batch_masks
-        
-    # 9. Альфа-смешивание и вставка обратно для каждого кадра
-    results = []
-    for i in range(B):
-        (left, top, crop_w, crop_h), _ = adjusted_params[i]
-        res_frame = frames_gpu[i].clone()
-        roi = res_frame[:, top:top+crop_h, left:left+crop_w].float()
-        
-        blended = (1.0 - alpha[i]) * roi + alpha[i] * processed_crops[i]
-        res_frame[:, top:top+crop_h, left:left+crop_w] = blended.to(frames_gpu[i].dtype)
-        results.append(res_frame)
-        
-    return results
+        out = migan_model(inp)
+
+    out = F.interpolate(
+        out, size=(crop_h, crop_w), mode="bilinear", align_corners=False
+    )
+    out = (out[0].cpu().permute(1, 2, 0) * 0.5 + 0.5).clamp(0, 1).numpy() * 255
+
+    mask_3ch = mask[:, :, np.newaxis]
+    composed = cropped.astype(np.float32) * mask_3ch + out * (1 - mask_3ch)
+    result = composed.clip(0, 255).astype(np.uint8)
+
+    output = frame.copy()
+    output[adjusted[1] : adjusted[3], adjusted[0] : adjusted[2]] = result
+
+    return output
+
+
+def process_video(
+    path_to_input_video: str,
+    path_to_output_video: str,
+    bbox: list,
+    yolo_model: YOLO,
+    migan_model,
+    device: torch.device,
+    padding: int = 20,
+    mask_dilation: int = 0,
+):
+    with (
+        av.open(path_to_input_video) as input_container,
+        av.open(path_to_output_video, mode="w") as output_container,
+    ):
+        if not input_container.streams.video:
+            raise ValueError("Input file have no video stream")
+
+        input_stream = input_container.streams.video[0]
+        total_frames = input_stream.frames if input_stream.frames > 0 else None
+
+        output_stream = output_container.add_stream(
+            "libx264", rate=input_stream.average_rate
+        )
+        output_stream.width = input_stream.width
+        output_stream.height = input_stream.height
+        output_stream.pix_fmt = "yuv420p"
+        output_stream.time_base = input_stream.time_base
+
+        pbar = tqdm(total=total_frames, desc="Processing", unit="frame")
+        for frame in input_container.decode(video=0):
+            image = frame.to_ndarray(format="rgb24")
+            image_processed = process_frame(
+                image, bbox, yolo_model, migan_model, device, padding, mask_dilation
+            )
+
+            new_frame = av.VideoFrame.from_ndarray(image_processed, format="rgb24")
+            new_frame.pts = frame.pts
+            new_frame.time_base = frame.time_base
+
+            for packet in output_stream.encode(new_frame):
+                output_container.mux(packet)
+
+            pbar.update(1)
+        pbar.close()
+
+        for packet in output_stream.encode(None):
+            output_container.mux(packet)
+
 
 def get_video_metadata(path_to_video: str) -> dict:
     with av.open(path_to_video) as container:
-        video_stream = container.streams.video[0]
-        metadata = {
-            "width": video_stream.codec_context.width,
-            "height": video_stream.codec_context.height,
-            "fps": video_stream.average_rate,
-            "time_base": video_stream.time_base,
-            "pix_fmt": video_stream.codec_context.pix_fmt,
-            "codec": video_stream.codec_context.name,
+        vs = container.streams.video[0]
+        return {
+            "width": vs.codec_context.width,
+            "height": vs.codec_context.height,
+            "fps": vs.average_rate,
+            "time_base": vs.time_base,
+            "pix_fmt": vs.codec_context.pix_fmt,
+            "codec": vs.codec_context.name,
             "has_audio": len(container.streams.audio) > 0,
         }
-        return metadata
 
 
-def get_yolo_model(path_to_yolo_model: str, device: str | DeviceLikeType) -> YOLO:
-    if not os.path.isfile(path_to_yolo_model):
-        raise FileNotFoundError(f"Model file not found: {path_to_yolo_model}")
-    device = torch.device(device)
+def _validate_env(path: str, device: str | DeviceLikeType) -> None:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Model file not found: {path}")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available.")
+
+
+def get_yolo_model(path_to_yolo_model: str, device: str | DeviceLikeType) -> "YOLO":
+    _validate_env(path_to_yolo_model, device)
+    device = torch.device(device)
     logger.info(f"Loading YOLO model from {path_to_yolo_model} on device {device}")
     try:
         model = YOLO(path_to_yolo_model).to(device)
-        logger.info("Model loaded successfully")
+        logger.info("YOLO model loaded successfully")
         return model
     except Exception as e:
-        logger.error(f"Failed to load model: {e}", exc_info=True)
+        logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
         raise
 
-def get_migan_model(path_to_migan_model: str, device: str | DeviceLikeType) -> torch.nn.Module:
-    if not os.path.isfile(path_to_migan_model):
-        raise FileNotFoundError(f"Model file not found: {path_to_migan_model}")
+
+def expand_bbox(bbox: list, padding: int, img_shape: tuple) -> tuple:
+    """
+    Expands bbox by padding pixels on all sides.
+    Guarantees coordinates stay within image bounds.
+
+    :param bbox: (x1, y1, x2, y2)
+    :param padding: number of pixels to expand
+    :param img_shape: (height, width) of the original frame
+    :return: new bbox (x1, y1, x2, y2)
+    """
+    x1, y1, x2, y2 = bbox
+    h, w = img_shape
+
+    x1_new = max(0, x1 - padding)
+    y1_new = max(0, y1 - padding)
+    x2_new = min(w, x2 + padding)
+    y2_new = min(h, y2 + padding)
+
+    return (x1_new, y1_new, x2_new, y2_new)
+
+
+def crop_frame_aligned(frame: np.ndarray, bbox: tuple, min_size: int = 256) -> tuple:
+    """
+    Crops frame as a square with minimum size, centered on the bbox.
+
+    :param frame: np.ndarray of the original frame
+    :param bbox: (x1, y1, x2, y2) target region
+    :param min_size: minimum crop size (default 256, legacy behavior)
+    :return: (cropped_frame: np.ndarray, adjusted_bbox: tuple)
+    """
+    x1, y1, x2, y2 = bbox
+    img_h, img_w = frame.shape[:2]
+
+    max_req = max(x2 - x1, y2 - y1)
+
+    if max_req <= 256:
+        size = 256
+    elif max_req <= 512:
+        size = 512
+    else:
+        size = int(np.ceil(max_req / 64) * 64)
+
+    size = max(size, min_size)
+
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+
+    x1_new = cx - size // 2
+    y1_new = cy - size // 2
+    x2_new = x1_new + size
+    y2_new = y1_new + size
+
+    if x1_new < 0:
+        x2_new -= x1_new
+        x1_new = 0
+    if y1_new < 0:
+        y2_new -= y1_new
+        y1_new = 0
+    if x2_new > img_w:
+        x1_new -= x2_new - img_w
+        x2_new = img_w
+    if y2_new > img_h:
+        y1_new -= y2_new - img_h
+        y2_new = img_h
+
+    x1_new = max(0, x1_new)
+    y1_new = max(0, y1_new)
+    x2_new = min(img_w, x2_new)
+    y2_new = min(img_h, y2_new)
+
+    adjusted_bbox = (x1_new, y1_new, x2_new, y2_new)
+    cropped = frame[y1_new:y2_new, x1_new:x2_new].copy()
+
+    return cropped, adjusted_bbox
+
+
+def get_migan_model(path_to_migan_model: str, device: str | DeviceLikeType):
+    _validate_env(path_to_migan_model, device)
     device = torch.device(device)
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but not available.")
-    
-    state_dict = torch.load(path_to_migan_model, map_location=device)
-    
-    # Автоматическое определение разрешения из ключей весов
-    resolution = 512 if any("b512" in k for k in state_dict.keys()) else 256
-    logger.info(f"Loading PyTorch MI-GAN model ({resolution}x{resolution}) from {path_to_migan_model} on device {device}")
-    
+    logger.info(
+        f"Loading PyTorch MI-GAN model from {path_to_migan_model} on device {device}"
+    )
     try:
-        model = MIGAN(resolution=resolution)
+        state_dict = torch.load(
+            path_to_migan_model, map_location=device, weights_only=True
+        )
+        resolution = 512 if any("b512" in k for k in state_dict) else 256
+        logger.info(f"Detected MI-GAN resolution: {resolution}")
+        model = Generator(resolution=resolution)
         model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
-        logger.info("Model loaded successfully")
+        del state_dict
+        logger.info("MI-GAN model loaded successfully")
         return model
     except Exception as e:
-        logger.error(f"Failed to load model: {e}", exc_info=True)
+        logger.error(f"Failed to load MI-GAN model: {e}", exc_info=True)
         raise
-
-
-def detect_scenes(video_path: str):
-    """Определяет границы сцен в видео с помощью scenedetect."""
-    try:
-        from scenedetect import ContentDetector, detect
-        logger.info(f"Начало поиска сцен в видео: {video_path}")
-        scene_list = detect(video_path, ContentDetector())
-        logger.info(f"Найдено сцен: {len(scene_list)}")
-        return scene_list
-    except Exception as e:
-        logger.warning(f"Не удалось запустить scenedetect ({e}). Видео будет обработано как одна сцена.")
-        return []
-
-
-def get_union_bbox(bboxes):
-    """Объединяет несколько ограничивающих прямоугольников в один общий."""
-    if not bboxes:
-        return None
-    if not isinstance(bboxes[0], list):
-        return bboxes
-    x1 = min(b[0] for b in bboxes)
-    y1 = min(b[1] for b in bboxes)
-    x2 = max(b[2] for b in bboxes)
-    y2 = max(b[3] for b in bboxes)
-    return [x1, y1, x2, y2]
-
-
-def run_yolo_detection(yolo_model, frame_np):
-    """Запускает YOLO для детекции вотермарок на кадре."""
-    results = yolo_model(frame_np, verbose=False)
-    bboxes = []
-    for result in results:
-        for box in result.boxes:
-            coords = box.xyxy[0].cpu().numpy().tolist()
-            bboxes.append(coords)
-    return bboxes
 
 
 def main():
     args = create_parser().parse_args()
-    
-    yolo_model = None
-    if args.path_to_yolo_model:
-        yolo_model = get_yolo_model(args.path_to_yolo_model, args.device)
-    elif not args.bbox:
-        raise ValueError("Необходимо указать либо --bbox для ручного ввода, либо --path_to_yolo_model для автоматического поиска.")
-
-    migan_model = get_migan_model(args.path_to_migan_model, args.device)
-    
-    # Загружаем метаданные видео
-    video_metadata = get_video_metadata(args.input)
-    logger.info(f"Метаданные видео: {video_metadata}")
-    
-    # Поиск сцен, если выбран режим static и нет ручного bbox
-    scene_boundaries = []
-    if args.mode == "static" and not args.bbox:
-        scenes = detect_scenes(args.input)
-        # Сохраняем номера кадров, на которых заканчиваются сцены
-        scene_boundaries = [s[1].get_frames() for s in scenes]
-        
-    input_container = av.open(args.input)
-    video_stream = input_container.streams.video[0]
-    
-    audio_stream = None
-    if len(input_container.streams.audio) > 0:
-        audio_stream = input_container.streams.audio[0]
-        
-    output_path = args.output
-    if os.path.isdir(output_path):
-        output_path = os.path.join(output_path, os.path.basename(args.input))
-    else:
-        _, ext = os.path.splitext(output_path)
-        if not ext:
-            _, input_ext = os.path.splitext(args.input)
-            output_path += input_ext
-            
-    output_container = av.open(output_path, mode="w")
-    
-    # Создаем видеопоток на запись с кодеком h264
-    output_video_stream = output_container.add_stream("libx264", rate=video_stream.average_rate)
-    output_video_stream.width = video_stream.codec_context.width
-    output_video_stream.height = video_stream.codec_context.height
-    output_video_stream.pix_fmt = "yuv420p"
-    output_video_stream.options = {"crf": "18"} # Высокое качество сжатия
-    
-    output_audio_stream = None
-    if audio_stream:
-        output_audio_stream = output_container.add_stream(audio_stream.codec_context.name, rate=audio_stream.rate)
-        
-    frame_buffer = []
-    pts_buffer = []
-    time_base_buffer = []
-    
-    # Переменная для хранения текущей статической маски/bbox сцены
-    current_static_bbox = None
-    frame_idx = 0
-    
-    def flush_buffer():
-        nonlocal current_static_bbox
-        if not frame_buffer:
-            return
-            
-        bboxes_to_use = []
-        if args.bbox:
-            # Ручной bbox статичен для всего видео
-            bboxes_to_use = [args.bbox] * len(frame_buffer)
-        else:
-            if args.mode == "static":
-                # В статичном режиме ищем вотермарку один раз (на первом кадре батча/сцены)
-                if current_static_bbox is None:
-                    first_frame_np = frame_buffer[0].to_ndarray(format="rgb24")
-                    detected_bboxes = run_yolo_detection(yolo_model, first_frame_np)
-                    current_static_bbox = get_union_bbox(detected_bboxes)
-                    if current_static_bbox is None:
-                        current_static_bbox = [0, 0, 0, 0] # Пустой bbox
-                bboxes_to_use = [current_static_bbox] * len(frame_buffer)
-            else:
-                # В динамичном режиме ищем вотермарку на каждом кадре
-                for f in frame_buffer:
-                    f_np = f.to_ndarray(format="rgb24")
-                    detected_bboxes = run_yolo_detection(yolo_model, f_np)
-                    union_bbox = get_union_bbox(detected_bboxes)
-                    if union_bbox is None:
-                        union_bbox = [0, 0, 0, 0]
-                    bboxes_to_use.append(union_bbox)
-                    
-        # Подготавливаем тензоры на GPU
-        device = torch.device(args.device)
-        gpu_frames = []
-        for f in frame_buffer:
-            f_np = f.to_ndarray(format="rgb24")
-            f_tensor = torch.from_numpy(f_np).permute(2, 0, 1).to(device)
-            gpu_frames.append(f_tensor)
-            
-        # Запускаем пакетный инпейнринг
-        processed_gpu_frames = process_video_frames_batch(
-            gpu_frames, bboxes_to_use, args.padding, args.blur, migan_model
-        )
-        
-        # Кодируем и сохраняем обработанные кадры
-        for i, processed_tensor in enumerate(processed_gpu_frames):
-            processed_np = processed_tensor.permute(1, 2, 0).byte().cpu().numpy()
-            out_frame = av.VideoFrame.from_ndarray(processed_np, format="rgb24")
-            out_frame.pts = pts_buffer[i]
-            out_frame.time_base = time_base_buffer[i]
-            
-            for packet in output_video_stream.encode(out_frame):
-                output_container.mux(packet)
-                
-        frame_buffer.clear()
-        pts_buffer.clear()е
-        time_base_buffer.clear()
-
-    logger.info("Начало обработки видеопотока...")
-    
-    # Основной цикл демультиплексирования
-    for packet in input_container.demux():
-        if packet.stream.type == "video":
-            for frame in packet.decode():
-                # Если наступила граница новой сцены, сбрасываем кэш статического bbox
-                if args.mode == "static" and frame_idx in scene_boundaries:
-                    flush_buffer()
-                    current_static_bbox = None
-                    
-                frame_buffer.append(frame)
-                pts_buffer.append(frame.pts)
-                time_base_buffer.append(frame.time_base)
-                frame_idx += 1
-                
-                # Если бафер заполнен, обрабатываем батч
-                if len(frame_buffer) >= args.batch_size:
-                    flush_buffer()
-                    
-        elif packet.stream.type == "audio" and output_audio_stream:
-            # Просто копируем аудиопакеты без декодирования
-            packet.stream = output_audio_stream
-            output_container.mux(packet)
-            
-    # Обрабатываем оставшиеся в буфере кадры
-    flush_buffer()
-    
-    # Сбрасываем видеокодер
-    for packet in output_video_stream.encode():
-        output_container.mux(packet)
-        
-    input_container.close()
-    output_container.close()
-    logger.info(f"Обработка завершена успешно. Видео сохранено в: {output_path}")
+    if not os.path.isfile(args.input):
+        raise FileNotFoundError(f"Input video not found: {args.input}")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    device = torch.device(args.device)
+    yolo_model = get_yolo_model(args.path_to_yolo_model, device)
+    migan_model = get_migan_model(args.path_to_migan_model, device)
+    process_video(
+        args.input,
+        args.output,
+        args.bbox,
+        yolo_model,
+        migan_model,
+        device,
+        args.padding,
+        args.mask_dilation,
+    )
 
 
 if __name__ == "__main__":
