@@ -80,6 +80,11 @@ def create_parser() -> argparse.ArgumentParser:
     # Previews
     parser.add_argument("--mask_preview", action="store_true")
     parser.add_argument("--inpaint_preview", action="store_true")
+    parser.add_argument(
+        "--debug_yolo",
+        action="store_true",
+        help="Output video with all YOLO detections drawn",
+    )
 
     return parser
 
@@ -156,22 +161,23 @@ def process_frame(
     if bbox is not None:
         x1, y1, x2, y2 = bbox
     else:
-        results = yolo_model(frame, verbose=False)
+        results = yolo_model(frame, verbose=False, conf=0.2, iou=0.4)
         if len(results) == 0 or len(results[0].boxes) == 0:
             return frame
-        box = results[0].boxes[0]
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
+        x1, y1 = int(np.min(boxes[:, 0])), int(np.min(boxes[:, 1]))
+        x2, y2 = int(np.max(boxes[:, 2])), int(np.max(boxes[:, 3]))
 
     expanded = expand_bbox((x1, y1, x2, y2), padding, (img_h, img_w))
-    cropped, adjusted = crop_frame_aligned(frame, expanded)
+    cropped, valid_bbox, (pad_left, pad_top) = crop_frame_aligned(frame, expanded)
 
-    crop_x1, crop_y1 = adjusted[0], adjusted[1]
+    crop_x1, crop_y1 = valid_bbox[0], valid_bbox[1]
 
     mask = np.ones(cropped.shape[:2], dtype=np.float32)
-    mx1 = max(0, x1 - crop_x1 - mask_dilation)
-    my1 = max(0, y1 - crop_y1 - mask_dilation)
-    mx2 = min(cropped.shape[1], x2 - crop_x1 + mask_dilation)
-    my2 = min(cropped.shape[0], y2 - crop_y1 + mask_dilation)
+    mx1 = max(0, x1 - crop_x1 + pad_left - mask_dilation)
+    my1 = max(0, y1 - crop_y1 + pad_top - mask_dilation)
+    mx2 = min(cropped.shape[1], x2 - crop_x1 + pad_left + mask_dilation)
+    my2 = min(cropped.shape[0], y2 - crop_y1 + pad_top + mask_dilation)
     mask[my1:my2, mx1:mx2] = 0.0
 
     model_res = migan_model.synthesis.resolution
@@ -183,9 +189,9 @@ def process_frame(
     img_resized = F.interpolate(
         img_tensor.unsqueeze(0),
         size=(model_res, model_res),
-        mode="bilinear",
+        mode="bicubic",
         align_corners=False,
-    )[0]
+    )[0].clamp(-1, 1)
     mask_resized = F.interpolate(
         mask_tensor, size=(model_res, model_res), mode="nearest"
     )[0]
@@ -199,19 +205,94 @@ def process_frame(
     with torch.no_grad():
         out = migan_model(inp)
 
-    out = F.interpolate(
-        out, size=(crop_h, crop_w), mode="bilinear", align_corners=False
-    )
-    out = (out[0].cpu().permute(1, 2, 0) * 0.5 + 0.5).clamp(0, 1).numpy() * 255
+    out = F.interpolate(out, size=(crop_h, crop_w), mode="bicubic", align_corners=False)
+    out = (out[0].cpu().permute(1, 2, 0) * 0.5 + 0.5).clamp(0, 1).numpy()
+    out = (out * 255).astype(np.uint8)
 
     mask_3ch = mask[:, :, np.newaxis]
-    composed = cropped.astype(np.float32) * mask_3ch + out * (1 - mask_3ch)
+    composed = cropped.astype(np.float32) * mask_3ch + out.astype(np.float32) * (
+        1 - mask_3ch
+    )
     result = composed.clip(0, 255).astype(np.uint8)
 
+    valid_h = valid_bbox[3] - valid_bbox[1]
+    valid_w = valid_bbox[2] - valid_bbox[0]
+    valid_region = result[pad_top : pad_top + valid_h, pad_left : pad_left + valid_w]
+
     output = frame.copy()
-    output[adjusted[1] : adjusted[3], adjusted[0] : adjusted[2]] = result
+    output[valid_bbox[1] : valid_bbox[3], valid_bbox[0] : valid_bbox[2]] = valid_region
 
     return output
+
+
+def debug_yolo(
+    path_to_input_video: str,
+    path_to_output_video: str,
+    yolo_model: YOLO,
+    device: torch.device,
+    conf: float = 0.05,
+    iou: float = 0.4,
+) -> None:
+    """
+    Renders every YOLO detection (all boxes, all confidence scores) onto each frame
+    and writes the result to a video file for visual inspection.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    input_container = av.open(path_to_input_video)
+    in_stream = input_container.streams.video[0]
+    width = in_stream.codec_context.width
+    height = in_stream.codec_context.height
+    fps = in_stream.average_rate
+
+    output_container = av.open(path_to_output_video, mode="w")
+    out_stream = output_container.add_stream("libx264", rate=fps)
+    out_stream.width = width
+    out_stream.height = height
+    out_stream.pix_fmt = "yuv420p"
+
+    total_frames = in_stream.frames or 0
+    pbar = tqdm(total=total_frames, desc="YOLO debug", unit="frame")
+
+    for frame in input_container.decode(video=0):
+        image = frame.to_ndarray(format="rgb24")
+
+        results = yolo_model(image, verbose=False, conf=conf, iou=iou)
+
+        if len(results) > 0 and len(results[0].boxes) > 0:
+            pil_img = Image.fromarray(image)
+            draw = ImageDraw.Draw(pil_img)
+
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            confs = results[0].boxes.conf.cpu().numpy()
+
+            for (x1, y1, x2, y2), conf_val in zip(boxes, confs):
+                ix1, iy1, ix2, iy2 = map(int, [x1, y1, x2, y2])
+                draw.rectangle([ix1, iy1, ix2, iy2], outline="green", width=2)
+                label = f"{conf_val:.2f}"
+                draw.rectangle(
+                    [ix1, iy1 - 14, ix1 + len(label) * 7 + 4, iy1], fill="green"
+                )
+                draw.text((ix1 + 2, iy1 - 13), label, fill="black")
+
+            image = np.array(pil_img)
+
+        new_frame = av.VideoFrame.from_ndarray(image, format="rgb24")
+        new_frame.pts = frame.pts
+        new_frame.time_base = frame.time_base
+
+        for packet in out_stream.encode(new_frame):
+            output_container.mux(packet)
+
+        pbar.update(1)
+
+    pbar.close()
+
+    for packet in out_stream.encode(None):
+        output_container.mux(packet)
+
+    output_container.close()
+    input_container.close()
 
 
 def process_video(
@@ -318,14 +399,52 @@ def expand_bbox(bbox: list, padding: int, img_shape: tuple) -> tuple:
     return (x1_new, y1_new, x2_new, y2_new)
 
 
+def pad_frame_edges(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> tuple:
+    """
+    Extracts a region from frame, padding out-of-bounds areas with edge replication.
+
+    :param frame: source frame (H, W, 3)
+    :param x1, y1, x2, y2: virtual crop coordinates (may extend beyond frame)
+    :return: (padded_crop, valid_origin) where valid_origin = (valid_x1, valid_y1)
+             is the position of the valid region inside the padded crop
+    """
+    img_h, img_w = frame.shape[:2]
+
+    pad_left = max(0, -x1)
+    pad_top = max(0, -y1)
+    pad_right = max(0, x2 - img_w)
+    pad_bottom = max(0, y2 - img_h)
+
+    x1_valid = max(0, x1)
+    y1_valid = max(0, y1)
+    x2_valid = min(img_w, x2)
+    y2_valid = min(img_h, y2)
+
+    valid = frame[y1_valid:y2_valid, x1_valid:x2_valid]
+
+    if pad_left or pad_top or pad_right or pad_bottom:
+        cropped = np.pad(
+            valid,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode="edge",
+        )
+    else:
+        cropped = valid.copy()
+
+    return cropped, (pad_left, pad_top)
+
+
 def crop_frame_aligned(frame: np.ndarray, bbox: tuple, min_size: int = 256) -> tuple:
     """
     Crops frame as a square with minimum size, centered on the bbox.
+    Out-of-bounds regions are padded with edge replication.
 
     :param frame: np.ndarray of the original frame
     :param bbox: (x1, y1, x2, y2) target region
-    :param min_size: minimum crop size (default 256, legacy behavior)
-    :return: (cropped_frame: np.ndarray, adjusted_bbox: tuple)
+    :param min_size: minimum crop size (default 256)
+    :return: (cropped_frame, valid_bbox, pad_offsets)
+             valid_bbox = (x1, y1, x2, y2) valid region in frame coords
+             pad_offsets = (pad_left, pad_top)
     """
     x1, y1, x2, y2 = bbox
     img_h, img_w = frame.shape[:2]
@@ -344,33 +463,21 @@ def crop_frame_aligned(frame: np.ndarray, bbox: tuple, min_size: int = 256) -> t
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
-    x1_new = cx - size // 2
-    y1_new = cy - size // 2
-    x2_new = x1_new + size
-    y2_new = y1_new + size
+    x1_virt = cx - size // 2
+    y1_virt = cy - size // 2
+    x2_virt = x1_virt + size
+    y2_virt = y1_virt + size
 
-    if x1_new < 0:
-        x2_new -= x1_new
-        x1_new = 0
-    if y1_new < 0:
-        y2_new -= y1_new
-        y1_new = 0
-    if x2_new > img_w:
-        x1_new -= x2_new - img_w
-        x2_new = img_w
-    if y2_new > img_h:
-        y1_new -= y2_new - img_h
-        y2_new = img_h
+    cropped, pad_offsets = pad_frame_edges(frame, x1_virt, y1_virt, x2_virt, y2_virt)
 
-    x1_new = max(0, x1_new)
-    y1_new = max(0, y1_new)
-    x2_new = min(img_w, x2_new)
-    y2_new = min(img_h, y2_new)
+    valid_bbox = (
+        max(0, x1_virt),
+        max(0, y1_virt),
+        min(img_w, x2_virt),
+        min(img_h, y2_virt),
+    )
 
-    adjusted_bbox = (x1_new, y1_new, x2_new, y2_new)
-    cropped = frame[y1_new:y2_new, x1_new:x2_new].copy()
-
-    return cropped, adjusted_bbox
+    return cropped, valid_bbox, pad_offsets
 
 
 def get_migan_model(path_to_migan_model: str, device: str | DeviceLikeType):
@@ -405,6 +512,11 @@ def main():
         raise RuntimeError("CUDA requested but not available.")
     device = torch.device(args.device)
     yolo_model = get_yolo_model(args.path_to_yolo_model, device)
+
+    if args.debug_yolo:
+        debug_yolo(args.input, args.output, yolo_model, device)
+        return
+
     migan_model = get_migan_model(args.path_to_migan_model, device)
     process_video(
         args.input,
