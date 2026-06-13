@@ -1,7 +1,7 @@
 [project]
 name = "ghostflicker"
 version = "0.1.0"
-description = "Add your description here"
+description = "Automatic watermark removal from video using YOLO detection and MI-GAN inpainting"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
