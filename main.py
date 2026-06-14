@@ -1,26 +1,11 @@
-"""CLI entry point for ghostflicker – two-stage watermark removal.
-
-Stage 1: Detection — YOLO + SmartTracker/SmartDetector scan the video,
-    normalise bbox data, and save to a JSON file.
-Stage 2: Inpainting — MI-GAN crops and inpaints every flagged region.
-
-The two stages are fully decoupled.  Provide --detection_file to skip
-Stage 1 and re-run only Stage 2 (useful for parameter tuning).
-"""
-
 import argparse
 import logging
 import os
 
 import torch
-from torch._prims_common import DeviceLikeType
 
-from detection import (
-    run_detection_stage,
-    save_detections,
-    load_detections,
-)
-from pipeline import process_video, debug_yolo
+from detection import load_detections, run_detection_stage, save_detections
+from pipeline import debug_yolo, process_video
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -28,206 +13,75 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Parser
-# ---------------------------------------------------------------------------
+def create_parser():
+    p = argparse.ArgumentParser(description="Watermark removal CLI.")
+    p.add_argument("-i", "--input", required=True)
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--path_to_yolo_model", required=True)
+    p.add_argument("--path_to_migan_model")
+    p.add_argument(
+        "-d", "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    p.add_argument(
+        "--detect_mode", choices=["per_frame", "scene", "smart"], default="per_frame"
+    )
+    p.add_argument("--bbox", type=int, nargs=4, metavar=("X1", "Y1", "X2", "Y2"))
+    p.add_argument("--conf", type=float, default=0.05)
+    p.add_argument("--iou", type=float, default=0.4)
+    p.add_argument("--scene_threshold", type=float, default=15.0)
+    p.add_argument("--max_skip", type=int, default=100)
+    p.add_argument("--padding", type=int, default=20)
+    p.add_argument("--mask_dilation", type=int, default=0)
+    p.add_argument("--detection_file")
+    p.add_argument("--save_detection_file")
+    p.add_argument("--debug_yolo", action="store_true")
+    return p
 
 
-def create_parser() -> argparse.ArgumentParser:
-    """Build the CLI argument parser."""
-    parser = argparse.ArgumentParser(
-        description="Remove watermarks from video using YOLO detection and MI-GAN inpainting"
-    )
-
-    # ---- I / O ----
-    parser.add_argument("-i", "--input", required=True, help="Input video file path")
-    parser.add_argument("-o", "--output", required=True, help="Output video file path")
-
-    # ---- Models ----
-    parser.add_argument(
-        "--path_to_yolo_model", required=True, help="Path to YOLO .pt file"
-    )
-    parser.add_argument(
-        "--path_to_migan_model",
-        default=None,
-        help="Path to MI-GAN .pt file (required unless --debug_yolo is set)",
-    )
-    parser.add_argument(
-        "-d",
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run inference on (cuda / cpu)",
-    )
-
-    # ---- Detection mode ----
-    parser.add_argument(
-        "--detect_mode",
-        choices=["per_frame", "scene", "smart"],
-        default="per_frame",
-        help="Detection mode (default: per_frame). "
-        "--bbox flag overrides all modes with a static box.",
-    )
-    parser.add_argument(
-        "--bbox",
-        type=int,
-        nargs=4,
-        metavar=("X1", "Y1", "X2", "Y2"),
-        help="Static bbox – skip YOLO, use this box for every frame",
-    )
-    parser.add_argument(
-        "--conf",
-        type=float,
-        default=0.05,
-        help="YOLO confidence threshold (default: 0.05)",
-    )
-    parser.add_argument(
-        "--iou",
-        type=float,
-        default=0.4,
-        help="YOLO NMS IoU threshold (default: 0.4)",
-    )
-    parser.add_argument(
-        "--scene_threshold",
-        type=float,
-        default=15.0,
-        help="pyscenedetect content-detector sensitivity "
-        "(lower = more scenes, default: 15.0)",
-    )
-    parser.add_argument(
-        "--max_skip",
-        type=int,
-        default=100,
-        help="Maximum Fibonacci frame skip in 'smart' mode (default: 100)",
-    )
-
-    # ---- Mask / crop ----
-    parser.add_argument(
-        "--padding",
-        type=int,
-        default=20,
-        help="Context padding (px) around the bbox before cropping (default: 20)",
-    )
-    parser.add_argument(
-        "--mask_dilation",
-        type=int,
-        default=0,
-        help="Expand the inpaint mask by N px on each side (default: 0)",
-    )
-
-    # ---- Pipeline stages ----
-    parser.add_argument(
-        "--detection_file",
-        default=None,
-        help="Path to a detection JSON file.  If provided, Stage 1 is skipped "
-        "and detections are loaded from this file instead.",
-    )
-    parser.add_argument(
-        "--save_detection_file",
-        default=None,
-        help="Path to save the detection JSON after Stage 1.  "
-        "If not set, detections are not persisted to disk.",
-    )
-
-    # ---- Debug ----
-    parser.add_argument(
-        "--debug_yolo",
-        action="store_true",
-        help="Output a video with all detections drawn (no inpainting)",
-    )
-
-    return parser
-
-
-# ---------------------------------------------------------------------------
-# Model loading helpers
-# ---------------------------------------------------------------------------
-
-
-def _validate_env(path: str, device: str | DeviceLikeType) -> None:
-    """Check that *path* exists and that *device* is available."""
+def _check_file(path, name):
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"Model file not found: {path}")
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but CUDA is not available on this machine")
+        raise FileNotFoundError(f"{name} not found: {path}")
 
 
-def get_yolo_model(path: str, device: str | DeviceLikeType):
-    """Load an Ultralytics YOLO model onto *device*."""
+def get_yolo_model(path, device):
     from ultralytics import YOLO
 
-    _validate_env(path, device)
-    device = torch.device(device)
-    logger.info("Loading YOLO model from %s on device %s", path, device)
-    try:
-        model = YOLO(path).to(device)
-        logger.info("YOLO model loaded successfully")
-        return model
-    except Exception as e:
-        logger.error("Failed to load YOLO model: %s", e, exc_info=True)
-        raise
+    _check_file(path, "YOLO")
+    return YOLO(path).to(device)
 
 
-def get_migan_model(path: str, device: str | DeviceLikeType):
-    """Load a MI-GAN Generator checkpoint, auto-detecting resolution (256/512)."""
+def get_migan_model(path, device):
     from migan_inference import Generator
 
-    _validate_env(path, device)
-    device = torch.device(device)
-    logger.info("Loading MI-GAN model from %s on device %s", path, device)
-    try:
-        state_dict = torch.load(path, map_location=device, weights_only=True)
-        # Detect resolution from state-dict keys (b512 -> 512, otherwise 256)
-        resolution = 512 if any("b512" in k for k in state_dict) else 256
-        logger.info("Detected MI-GAN resolution: %d", resolution)
-        model = Generator(resolution=resolution)
-        model.load_state_dict(state_dict)
-        model.to(device)
-        model.eval()
-        del state_dict
-        logger.info("MI-GAN model loaded successfully")
-        return model
-    except Exception as e:
-        logger.error("Failed to load MI-GAN model: %s", e, exc_info=True)
-        raise
+    _check_file(path, "MI-GAN")
+    state_dict = torch.load(path, map_location=device, weights_only=True)
+    res = 512 if any("b512" in k for k in state_dict) else 256
+    model = Generator(resolution=res)
+    model.load_state_dict(state_dict)
+    model.to(device).eval()
+    del state_dict
+    return model
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    """Parse CLI arguments and run the two-stage watermark removal pipeline.
-
-    Stage 1 (detection):
-        Unless ``--detection_file`` is given, scan the video with YOLO +
-        SmartTracker/SmartDetector and produce a per-frame bbox mapping.
-        Optionally persist to disk via ``--save_detection_file``.
-
-    Stage 2 (inpainting):
-        Take the detections from Stage 1 and run MI-GAN inpainting on every
-        flagged frame.  Output is written to ``--output``.
-    """
+def main():
     args = create_parser().parse_args()
 
-    # ---- Validate inputs ----
-    if not os.path.isfile(args.input):
-        raise FileNotFoundError(f"Input file not found: {args.input}")
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but not available.")
+    # Fail fast: валидация окружения и входных данных
+    _check_file(args.input, "Input")
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA unavailable.")
+    if not args.debug_yolo and not args.path_to_migan_model:
+        raise ValueError("MI-GAN path required.")
 
-    # ---- Stage 1: detection ----
+    # Stage 1: Detection
     if args.detection_file:
-        # Load pre-computed detections from disk — skip YOLO entirely.
-        logger.info("Loading detections from %s (Stage 1 skipped)", args.detection_file)
         detections = load_detections(args.detection_file)
     else:
-        # Run the full detection pass.
-        yolo_model = get_yolo_model(args.path_to_yolo_model, device)
+        yolo = get_yolo_model(args.path_to_yolo_model, device)
         detections = run_detection_stage(
             args.input,
-            yolo_model,
+            yolo,
             args.detect_mode,
             args.conf,
             args.iou,
@@ -238,24 +92,17 @@ def main() -> None:
         if args.save_detection_file:
             save_detections(detections, args.save_detection_file, args.input)
 
-    # ---- Debug: draw detections only, skip inpainting ----
     if args.debug_yolo:
         debug_yolo(args.input, args.output, detections)
         return
 
-    # ---- Stage 2: inpainting ----
-    if not args.path_to_migan_model:
-        raise ValueError(
-            "--path_to_migan_model is required for inpainting "
-            "(or use --debug_yolo to skip inpainting)"
-        )
-    migan_model = get_migan_model(args.path_to_migan_model, device)
-
+    # Stage 2: Inpainting
+    migan = get_migan_model(args.path_to_migan_model, device)
     process_video(
         args.input,
         args.output,
         detections,
-        migan_model,
+        migan,
         device,
         args.padding,
         args.mask_dilation,
